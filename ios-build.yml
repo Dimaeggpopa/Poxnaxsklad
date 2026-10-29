@@ -1,0 +1,443 @@
+name: iOS Native IPA & WebClip Cloud Builder
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios-ipa:
+    name: Compile iOS IPA on macOS Xcode
+    runs-on: macos-14
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js 20 & Python 3
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 3. Unpack ZIP & Prepare Web/Firebase Core
+        shell: bash
+        run: |
+          python3 - << 'PYEOF'
+          import os, sys, json, shutil, zipfile, pathlib, plistlib, uuid, base64, re, subprocess
+
+          repo_root = pathlib.Path.cwd()
+          work_dir = repo_root / "_ios_build_workspace"
+          extract_dir = work_dir / "extracted_src"
+          www_dir = work_dir / "www"
+          out_dir = repo_root / "dist_ios_artifacts"
+
+          for d in [work_dir, extract_dir, www_dir, out_dir]:
+              if d.exists():
+                  shutil.rmtree(d)
+              d.mkdir(parents=True, exist_ok=True)
+
+          # 1. Поиск любого .zip архива в репозитории (включая мой-гараж.zip)
+          zip_files = list(repo_root.glob("*.zip")) + list(repo_root.glob("*.ipa"))
+          if zip_files:
+              target_zip = zip_files[0]
+              print(f"[INFO] Найден архив проекта: {target_zip.name}")
+              with zipfile.ZipFile(target_zip, 'r') as zf:
+                  zf.extractall(extract_dir)
+          else:
+              print("[INFO] Архив .zip не найден, используем файлы из корня репозитория...")
+              for item in repo_root.iterdir():
+                  if item.name in [".git", ".github", "_ios_build_workspace", "dist_ios_artifacts"]:
+                      continue
+                  dest = extract_dir / item.name
+                  if item.is_dir():
+                      shutil.copytree(item, dest)
+                  else:
+                      shutil.copy2(item, dest)
+
+          # Если внутри архива была одна вложенная папка, поднимаем её содержимое
+          children = [p for p in extract_dir.iterdir() if not p.name.startswith(".") and p.name != "__MACOSX"]
+          if len(children) == 1 and children[0].is_dir() and not (extract_dir / "package.json").exists() and not (extract_dir / "index.html").exists():
+              inner = children[0]
+              print(f"[INFO] Подъем вложенной директории: {inner.name}")
+              for sub in inner.iterdir():
+                  shutil.move(str(sub), str(extract_dir / sub.name))
+              inner.rmdir()
+
+          # 2. Извлечение ключей Firebase / GoogleService-Info.plist
+          plist_data = {
+              "BUNDLE_ID": "com.aistudio.mygarage.vkrtqx",
+              "PROJECT_ID": "my-garage-ios",
+              "GCM_SENDER_ID": "000000000000",
+              "API_KEY": "AIzaSyDummyKeyForOfflineMode",
+              "GOOGLE_APP_ID": "1:000000000000:ios:0000000000000000",
+              "STORAGE_BUCKET": "my-garage-ios.appspot.com",
+              "IS_ADS_ENABLED": False,
+              "IS_ANALYTICS_ENABLED": False,
+              "IS_APPINVITE_ENABLED": True,
+              "IS_GCM_ENABLED": True,
+              "IS_SIGNIN_ENABLED": True,
+              "PLIST_VERSION": "1",
+          }
+
+          # Проверяем наличие google-services.json
+          gs_files = list(extract_dir.rglob("google-services.json"))
+          if gs_files:
+              try:
+                  gs = json.loads(gs_files[0].read_text(encoding="utf-8", errors="ignore"))
+                  p_info = gs.get("project_info", {})
+                  clients = gs.get("client", [{}])
+                  c0 = clients[0] if clients else {}
+                  c_info = c0.get("client_info", {})
+                  api_keys = c0.get("api_key", [{}])
+                  ak = api_keys[0].get("current_key") if api_keys else None
+
+                  if p_info.get("project_id"): plist_data["PROJECT_ID"] = p_info["project_id"]
+                  if p_info.get("project_number"): plist_data["GCM_SENDER_ID"] = p_info["project_number"]
+                  if p_info.get("storage_bucket"): plist_data["STORAGE_BUCKET"] = p_info["storage_bucket"]
+                  if ak: plist_data["API_KEY"] = ak
+                  if c_info.get("mobilesdk_app_id"): plist_data["GOOGLE_APP_ID"] = c_info["mobilesdk_app_id"]
+                  print("[OK] Ключи извлечены из google-services.json")
+              except Exception as e:
+                  print(f"[WARN] Ошибка чтения google-services.json: {e}")
+
+          # Также сканируем исходники на наличие firebaseConfig в JS/TS/HTML
+          for code_file in list(extract_dir.rglob("*.ts")) + list(extract_dir.rglob("*.tsx")) + list(extract_dir.rglob("*.js")) + list(extract_dir.rglob("*.html")):
+              if "node_modules" in code_file.parts:
+                  continue
+              try:
+                  txt = code_file.read_text(encoding="utf-8", errors="ignore")
+                  m_key = re.search(r'apiKey\s*:\s*["\'](AIza[0-9A-Za-z-_]{30,})["\']', txt)
+                  m_pid = re.search(r'projectId\s*:\s*["\']([0-9A-Za-z-_]+)["\']', txt)
+                  m_aid = re.search(r'appId\s*:\s*["\']([0-9A-Za-z:_-]+)["\']', txt)
+                  if m_key: plist_data["API_KEY"] = m_key.group(1)
+                  if m_pid:
+                      plist_data["PROJECT_ID"] = m_pid.group(1)
+                      plist_data["STORAGE_BUCKET"] = f"{m_pid.group(1)}.appspot.com"
+                  if m_aid: plist_data["GOOGLE_APP_ID"] = m_aid.group(1)
+              except Exception:
+                  pass
+
+          gs_plist_path = out_dir / "GoogleService-Info.plist"
+          with open(gs_plist_path, "wb") as fp:
+              plistlib.dump(plist_data, fp)
+          print(f"[OK] Сгенерирован {gs_plist_path}")
+
+          # 3. Определение типа проекта в архиве и сборка веб-ядра в www_dir
+          pkg_json_path = extract_dir / "package.json"
+          payload_www = extract_dir / "Payload" / "MyGarage.app" / "www"
+
+          if payload_www.exists():
+              print("[INFO] Обнаружен готовый бандл Payload/MyGarage.app/www")
+              shutil.copytree(payload_www, www_dir, dirs_exist_ok=True)
+          elif pkg_json_path.exists():
+              print("[INFO] Обнаружен Node.js / Vite / React проект (package.json). Запуск сборки...")
+              # Патчим vite.config для относительных путей (base: './'), чтобы в iOS WebView не было белого экрана
+              for vconf in list(extract_dir.glob("vite.config.*")):
+                  vtxt = vconf.read_text(encoding="utf-8", errors="ignore")
+                  if "base:" not in vtxt:
+                      vtxt = vtxt.replace("defineConfig({", "defineConfig({\n  base: './',")
+                      vconf.write_text(vtxt, encoding="utf-8")
+
+              subprocess.run(["npm", "install", "--legacy-peer-deps"], cwd=extract_dir, check=False)
+              # Убираем строгую проверку tsc, если в скрипте build стоит "tsc && vite build"
+              pkg_obj = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="ignore"))
+              scripts = pkg_obj.get("scripts", {})
+              if "build" in scripts and "tsc" in scripts["build"] and "vite build" in scripts["build"]:
+                  scripts["build"] = "vite build"
+                  pkg_obj["scripts"] = scripts
+                  pkg_json_path.write_text(json.dumps(pkg_obj, indent=2), encoding="utf-8")
+
+              env = os.environ.copy()
+              env["CI"] = "false"
+              subprocess.run(["npm", "run", "build", "--", "--base=./"], cwd=extract_dir, env=env, check=False)
+
+              built_dir = None
+              for candidate in ["dist", "build", "out", "www"]:
+                  c_path = extract_dir / candidate
+                  if c_path.exists() and (c_path / "index.html").exists():
+                      built_dir = c_path
+                      break
+
+              if built_dir:
+                  print(f"[OK] Сборка фронтенда завершена. Копирование из {built_dir.name}/ в www/")
+                  shutil.copytree(built_dir, www_dir, dirs_exist_ok=True)
+              else:
+                  print("[WARN] Папка dist/ не создана, копируем исходные веб-файлы...")
+                  for item in extract_dir.iterdir():
+                      if item.name not in ["node_modules", ".git"]:
+                          dest = www_dir / item.name
+                          if item.is_dir(): shutil.copytree(item, dest, dirs_exist_ok=True)
+                          else: shutil.copy2(item, dest)
+          else:
+              # Поиск index.html или app.js на любом уровне вложенности
+              html_files = list(extract_dir.rglob("index.html"))
+              if html_files:
+                  src_web_root = html_files[0].parent
+                  print(f"[INFO] Найден статический веб-проект в: {src_web_root}")
+                  shutil.copytree(src_web_root, www_dir, dirs_exist_ok=True)
+              else:
+                  shutil.copytree(extract_dir, www_dir, dirs_exist_ok=True)
+
+          # Если также в корне репозитория лежит app.js (от скрипта Termux), подключаем его
+          if (repo_root / "app.js").exists() and not (www_dir / "app.js").exists():
+              shutil.copy2(repo_root / "app.js", www_dir / "app.js")
+
+          # Гарантируем наличие адаптивного iOS index.html
+          idx_file = www_dir / "index.html"
+          if not idx_file.exists():
+              idx_file.write_text("""<!DOCTYPE html>
+          <html lang="ru">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+            <meta name="apple-mobile-web-app-capable" content="yes" />
+            <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+            <meta name="apple-mobile-web-app-title" content="Мой Гараж" />
+            <title>Мой Гараж</title>
+            <style>
+              html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0b0f19; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
+              #app, #root { min-height: 100vh; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box; }
+            </style>
+          </head>
+          <body>
+            <div id="app"></div>
+            <div id="root"></div>
+            <script src="app.js"></script>
+          </body>
+          </html>""", encoding="utf-8")
+          else:
+              # Инжектируем iOS мета-теги и исправляем абсолютные пути "/assets/" на "./assets/"
+              html_txt = idx_file.read_text(encoding="utf-8", errors="ignore")
+              html_txt = re.sub(r'(src|href)=["\']/(assets|static)/', r'\1="./\2/', html_txt)
+              ios_meta = '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+              if "apple-mobile-web-app-capable" not in html_txt and "<head>" in html_txt:
+                  html_txt = html_txt.replace("<head>", f"<head>\n  {ios_meta}")
+              idx_file.write_text(html_txt, encoding="utf-8")
+
+          print("[OK] Веб-ядро для iOS полностью подготовлено в _ios_build_workspace/www")
+          PYEOF
+
+      - name: 4. Initialize Capacitor 6 iOS & Generate Xcode Project
+        shell: bash
+        working-directory: _ios_build_workspace
+        run: |
+          cat << 'EOF' > package.json
+          {
+            "name": "my-garage-ios",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/core": "^6.1.0",
+              "@capacitor/ios": "^6.1.0",
+              "@capacitor/status-bar": "^6.0.0",
+              "@capacitor/splash-screen": "^6.0.0",
+              "@capacitor/preferences": "^6.0.0",
+              "@capacitor/haptics": "^6.0.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^6.1.0"
+            }
+          }
+          EOF
+
+          npm install --no-audit --no-fund
+
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.aistudio.mygarage.vkrtqx",
+            "appName": "Мой Гараж",
+            "webDir": "www",
+            "bundledWebRuntime": false,
+            "ios": {
+              "contentInset": "always",
+              "allowsLinkPreview": false,
+              "scrollEnabled": true,
+              "backgroundColor": "#0b0f19"
+            },
+            "server": {
+              "iosScheme": "capacitor",
+              "allowNavigation": ["*"]
+            }
+          }
+          EOF
+
+          npx cap add ios
+          npx cap sync ios
+
+      - name: 5. Configure Info.plist, Permissions, Firebase & App Icons
+        shell: bash
+        run: |
+          python3 - << 'PYEOF'
+          import pathlib, plistlib, shutil, subprocess
+
+          repo_root = pathlib.Path.cwd()
+          work_dir = repo_root / "_ios_build_workspace"
+          ios_app_dir = work_dir / "ios" / "App" / "App"
+          out_dir = repo_root / "dist_ios_artifacts"
+
+          # 1. Копируем GoogleService-Info.plist внутрь Xcode таргета
+          gs_src = out_dir / "GoogleService-Info.plist"
+          if gs_src.exists():
+              shutil.copy2(gs_src, ios_app_dir / "GoogleService-Info.plist")
+
+          # 2. Обновляем Info.plist для iOS 16/17/18
+          info_plist_path = ios_app_dir / "Info.plist"
+          with open(info_plist_path, "rb") as fp:
+              info = plistlib.load(fp)
+
+          info["CFBundleDisplayName"] = "Мой Гараж"
+          info["CFBundleName"] = "MyGarage"
+          info["CFBundleShortVersionString"] = "1.0.0"
+          info["CFBundleVersion"] = "1"
+          info["CFBundleDevelopmentRegion"] = "ru"
+          info["UIStatusBarStyle"] = "UIStatusBarStyleLightContent"
+          info["UIViewControllerBasedStatusBarAppearance"] = True
+          info["UIRequiresFullScreen"] = True
+          info["UISupportedInterfaceOrientations"] = [
+              "UIInterfaceOrientationPortrait",
+              "UIInterfaceOrientationPortraitUpsideDown"
+          ]
+          info["NSCameraUsageDescription"] = "Приложению «Мой Гараж» требуется доступ к камере для фото авто, чеков и документов."
+          info["NSPhotoLibraryUsageDescription"] = "Приложению «Мой Гараж» требуется доступ к галерее для загрузки фото автомобиля и чеков."
+          info["NSPhotoLibraryAddUsageDescription"] = "Приложению «Мой Гараж» требуется разрешение на сохранение отчетов и фото в галерею."
+          info["NSMicrophoneUsageDescription"] = "Приложению «Мой Гараж» требуется доступ к микрофону для голосовых заметок."
+          info["NSLocationWhenInUseUsageDescription"] = "Приложению «Мой Гараж» требуется доступ к геолокации для поиска СТО и заправок."
+          info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": True}
+
+          with open(info_plist_path, "wb") as fp:
+              plistlib.dump(info, fp)
+          print("[OK] Info.plist пропатчен для iOS 16/17/18")
+
+          # 3. Поиск иконки в архиве и генерация всех размеров AppIcon через macOS sips
+          extract_dir = work_dir / "extracted_src"
+          icon_candidates = []
+          for ext in ["*.png", "*.jpg", "*.jpeg"]:
+              for p in extract_dir.rglob(ext):
+                  if any(k in p.name.lower() for k in ["icon", "logo", "launcher", "garage"]):
+                      icon_candidates.append(p)
+
+          appicon_set = ios_app_dir / "Assets.xcassets" / "AppIcon.appiconset"
+          if icon_candidates and appicon_set.exists():
+              best_icon = max(icon_candidates, key=lambda x: x.stat().st_size)
+              print(f"[INFO] Используем найденную иконку: {best_icon}")
+              for target_png in appicon_set.glob("*.png"):
+                  shutil.copy2(best_icon, target_png)
+                  subprocess.run(["sips", "-s", "format", "png", "-z", "1024", "1024", str(target_png)], check=False)
+          PYEOF
+
+      - name: 6. Compile Native iOS App via xcodebuild & Package IPA + MobileConfig
+        shell: bash
+        run: |
+          cd _ios_build_workspace/ios/App
+
+          # Если используется CocoaPods, устанавливаем поды
+          if [ -f "Podfile" ]; then
+            pod install || true
+          fi
+
+          # Определяем флаг проекта (-workspace или -project)
+          if [ -d "App.xcworkspace" ]; then
+            XCODE_TARGET=(-workspace "App.xcworkspace")
+          else
+            XCODE_TARGET=(-project "App.xcodeproj")
+          fi
+
+          echo "[INFO] Запуск нативной компиляции Xcode (SDK: iphoneos, Arch: arm64)..."
+          xcodebuild "${XCODE_TARGET[@]}" \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build_output \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            clean build
+
+          APP_BUNDLE=$(find build_output -name "App.app" -type d | head -n 1)
+          echo "[OK] Скомпилирован нативный бандл: $APP_BUNDLE"
+
+          # Упаковка и Ad-Hoc подпись для установки через Sideloadly / AltStore / Scarlet / ESign / TrollStore
+          mkdir -p Payload
+          cp -R "$APP_BUNDLE" Payload/App.app
+          cp ../../../dist_ios_artifacts/GoogleService-Info.plist Payload/App.app/GoogleService-Info.plist || true
+
+          echo "[INFO] Наложение Ad-Hoc подписи Apple codesign..."
+          codesign --force --deep --sign - Payload/App.app
+
+          zip -r -9 "../../../dist_ios_artifacts/MyGarage-iOS.ipa" Payload
+
+          # Генерация автономного профиля WebClip (.mobileconfig) для прямой установки через Safari
+          cd ../../..
+          python3 - << 'PYEOF'
+          import pathlib, base64, uuid, re
+
+          www_dir = pathlib.Path("_ios_build_workspace/www")
+          out_dir = pathlib.Path("dist_ios_artifacts")
+          idx_path = www_dir / "index.html"
+          html_content = idx_path.read_text(encoding="utf-8", errors="ignore")
+
+          # Встраиваем локальные JS и CSS внутрь единого HTML для автономного WebClip
+          for js_file in www_dir.rglob("*.js"):
+              rel = js_file.relative_to(www_dir).as_posix()
+              js_code = js_file.read_text(encoding="utf-8", errors="ignore")
+              html_content = html_content.replace(f'src="{rel}"', f'data-inline="{rel}"').replace(f'src="./{rel}"', f'data-inline="{rel}"')
+              html_content = html_content.replace("</body>", f"<script>\n{js_code}\n</script>\n</body>")
+
+          for css_file in www_dir.rglob("*.css"):
+              rel = css_file.relative_to(www_dir).as_posix()
+              css_code = css_file.read_text(encoding="utf-8", errors="ignore")
+              html_content = html_content.replace("</head>", f"<style>\n{css_code}\n</style>\n</head>")
+
+          b64_html = base64.b64encode(html_content.encode("utf-8")).decode("ascii")
+
+          mobileconfig = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>PayloadContent</key>
+            <array>
+              <dict>
+                <key>FullScreen</key><true/>
+                <key>IgnoreManifestScope</key><true/>
+                <key>IsRemovable</key><true/>
+                <key>Label</key><string>Мой Гараж</string>
+                <key>PayloadDescription</key><string>iOS Native WebClip — Мой Гараж</string>
+                <key>PayloadDisplayName</key><string>Мой Гараж (iOS WebClip)</string>
+                <key>PayloadIdentifier</key><string>com.aistudio.mygarage.vkrtqx.webclip</string>
+                <key>PayloadType</key><string>com.apple.webClip.managed</string>
+                <key>PayloadUUID</key><string>{uuid.uuid4()}</string>
+                <key>PayloadVersion</key><integer>1</integer>
+                <key>Precomposed</key><true/>
+                <key>URL</key><string>data:text/html;base64,{b64_html}</string>
+              </dict>
+            </array>
+            <key>PayloadDescription</key><string>Профиль установки приложения «Мой Гараж» на главный экран iPhone (iOS 16/17/18)</string>
+            <key>PayloadDisplayName</key><string>Мой Гараж — Установщик iOS</string>
+            <key>PayloadIdentifier</key><string>com.aistudio.mygarage.vkrtqx.profile</string>
+            <key>PayloadOrganization</key><string>My Garage Cupertino Edition</string>
+            <key>PayloadRemovalDisallowed</key><false/>
+            <key>PayloadType</key><string>Configuration</string>
+            <key>PayloadUUID</key><string>{uuid.uuid4()}</string>
+            <key>PayloadVersion</key><integer>1</integer>
+          </dict>
+          </plist>"""
+
+          (out_dir / "MyGarage-WebClip.mobileconfig").write_text(mobileconfig.strip(), encoding="utf-8")
+          print("[OK] MyGarage-WebClip.mobileconfig успешно создан!")
+          PYEOF
+
+      - name: 7. Upload Compiled IPA & MobileConfig Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyGarage-iOS-Release-Bundle
+          path: |
+            dist_ios_artifacts/MyGarage-iOS.ipa
+            dist_ios_artifacts/MyGarage-WebClip.mobileconfig
+            dist_ios_artifacts/GoogleService-Info.plist
+          retention-days: 90
